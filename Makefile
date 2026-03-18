@@ -1,5 +1,5 @@
 PLUGINS_DIR := plugins
-PLUGINS := http ansible
+PLUGINS := http terraform
 
 .PHONY: all clean $(PLUGINS)
 
