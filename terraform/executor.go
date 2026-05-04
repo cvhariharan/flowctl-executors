@@ -20,10 +20,11 @@ import (
 )
 
 type TerraformWithConfig struct {
-	Repo    string `yaml:"repo" json:"repo" jsonschema:"title=Repository,description=Git repository URL (HTTPS or SSH),required"`
-	Token   string `yaml:"token,omitempty" json:"token,omitempty" jsonschema:"title=Token,description=Deploy token or access key. Supports ${ENV_VAR} substitution. Optional for public repos"`
-	Path    string `yaml:"path,omitempty" json:"path,omitempty" jsonschema:"title=Path,description=Subdirectory within the repo containing the Terraform module"`
-	Command string `yaml:"command,omitempty" json:"command,omitempty" jsonschema:"title=Command,description=Terraform command to run (default: apply -auto-approve)"`
+	Repo     string `yaml:"repo" json:"repo" jsonschema:"title=Repository,description=Git repository URL (HTTPS or SSH),required"`
+	Username string `yaml:"username,omitempty" json:"username,omitempty" jsonschema:"title=Username,description=Username for HTTPS basic auth. Examples: 'x-access-token' for GitHub fine-grained PATs, 'oauth2' for GitLab, 'gitea' for Gitea. Ignored for SSH URLs"`
+	Token    string `yaml:"token,omitempty" json:"token,omitempty" jsonschema:"title=Token,description=Deploy token or access key. Supports ${ENV_VAR} substitution. Optional for public repos"`
+	Path     string `yaml:"path,omitempty" json:"path,omitempty" jsonschema:"title=Path,description=Subdirectory within the repo containing the Terraform module"`
+	Command  string `yaml:"command,omitempty" json:"command,omitempty" jsonschema:"title=Command,description=Terraform command to run (default: apply -auto-approve)"`
 }
 
 type TerraformExecutor struct {
@@ -106,15 +107,13 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 			}
 			cloneOpts.Auth = auth
 		} else {
-			// HTTPS with token — supports "username:password" or bare token
-			username, password := "", token
-			if i := strings.Index(token, ":"); i >= 0 {
-				username = token[:i]
-				password = token[i+1:]
+			username := substituteEnvVars(config.Username, execCtx.Inputs)
+			if username == "" {
+				return nil, fmt.Errorf("username is required for HTTPS auth (e.g. 'x-access-token' for GitHub, 'oauth2' for GitLab)")
 			}
 			cloneOpts.Auth = &githttp.BasicAuth{
 				Username: username,
-				Password: password,
+				Password: token,
 			}
 		}
 	}
@@ -124,7 +123,6 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 		return nil, fmt.Errorf("failed to clone repository: %w", err)
 	}
 
-	// Determine the module directory
 	moduleDir := cloneDir
 	if config.Path != "" {
 		moduleDir = filepath.Join(cloneDir, config.Path)
@@ -133,8 +131,7 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 		}
 	}
 
-	// Prepare env vars from inputs
-	var env []string
+	env := os.Environ()
 	for k, v := range execCtx.Inputs {
 		env = append(env, fmt.Sprintf("%s=%s", k, fmt.Sprint(v)))
 	}
@@ -145,7 +142,39 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 	return e.executeLocal(ctx, execCtx, moduleDir, config.Command, env)
 }
 
+const stateFileName = "terraform.tfstate"
+
+type stateKV struct {
+	client *executor.APIClient
+	bucket string
+	key    string
+}
+
+func (e *TerraformExecutor) stateKV(execCtx executor.ExecutionContext) *stateKV {
+	if execCtx.APIBaseURL == "" || execCtx.APIKey == "" {
+		return nil
+	}
+	return &stateKV{
+		client: executor.NewAPIClient(execCtx.APIBaseURL, execCtx.APIKey, execCtx.UserUUID),
+		bucket: e.name,
+		key:    fmt.Sprintf("%s-%s", execCtx.NamespaceName, execCtx.FlowName),
+	}
+}
+
 func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.ExecutionContext, moduleDir, command string, env []string) (map[string]string, error) {
+	statePath := filepath.Join(moduleDir, stateFileName)
+	kv := e.stateKV(execCtx)
+	if kv != nil {
+		if state, err := kv.client.KVGet(ctx, kv.bucket, kv.key); err == nil && state != "" {
+			fmt.Fprintf(execCtx.Stdout, "Restoring terraform state from %s/%s...\n", kv.bucket, kv.key)
+			if err := os.WriteFile(statePath, []byte(state), 0600); err != nil {
+				return nil, fmt.Errorf("failed to write restored state file: %w", err)
+			}
+		} else if err != nil {
+			fmt.Fprintf(execCtx.Stdout, "No prior state found (%v), starting fresh\n", err)
+		}
+	}
+
 	fmt.Fprintf(execCtx.Stdout, "Running terraform init...\n")
 	initCmd := fmt.Sprintf("terraform -chdir=%s init -no-color", moduleDir)
 	if err := e.driver.Exec(ctx, initCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
@@ -154,11 +183,27 @@ func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.E
 
 	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", command)
 	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", moduleDir, command)
-	if err := e.driver.Exec(ctx, tfCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
-		return nil, fmt.Errorf("terraform %s failed: %w", command, err)
+	tfErr := e.driver.Exec(ctx, tfCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr)
+
+	if kv != nil {
+		if data, err := os.ReadFile(statePath); err == nil {
+			persistState(ctx, kv, data, execCtx.Stdout, execCtx.Stderr)
+		} else if !os.IsNotExist(err) {
+			fmt.Fprintf(execCtx.Stderr, "warning: could not read state file for persistence: %v\n", err)
+		}
 	}
 
+	if tfErr != nil {
+		return nil, fmt.Errorf("terraform %s failed: %w", command, tfErr)
+	}
 	return map[string]string{"status": "success"}, nil
+}
+
+func persistState(ctx context.Context, kv *stateKV, data []byte, stdout, stderr io.Writer) {
+	fmt.Fprintf(stdout, "Persisting terraform state to %s/%s...\n", kv.bucket, kv.key)
+	if err := kv.client.KVSet(ctx, kv.bucket, kv.key, string(data)); err != nil {
+		fmt.Fprintf(stderr, "warning: failed to persist terraform state: %v\n", err)
+	}
 }
 
 func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.ExecutionContext, moduleDir, command string, env []string) (map[string]string, error) {
@@ -178,6 +223,24 @@ func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.
 		return nil, err
 	}
 
+	remoteStatePath := e.driver.Join(remoteDir, stateFileName)
+	kv := e.stateKV(execCtx)
+	if kv != nil {
+		if state, err := kv.client.KVGet(ctx, kv.bucket, kv.key); err == nil && state != "" {
+			fmt.Fprintf(execCtx.Stdout, "Restoring terraform state from %s/%s...\n", kv.bucket, kv.key)
+			tmpPath, err := writeTempFile("tfstate-*.json", []byte(state))
+			if err != nil {
+				return nil, err
+			}
+			defer os.Remove(tmpPath)
+			if err := e.driver.Upload(ctx, tmpPath, remoteStatePath); err != nil {
+				return nil, fmt.Errorf("failed to upload state file: %w", err)
+			}
+		} else if err != nil {
+			fmt.Fprintf(execCtx.Stdout, "No prior state found (%v), starting fresh\n", err)
+		}
+	}
+
 	fmt.Fprintf(execCtx.Stdout, "Running terraform init...\n")
 	initCmd := fmt.Sprintf("terraform -chdir=%s init -no-color", remoteDir)
 	if err := e.driver.Exec(ctx, initCmd, remoteDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
@@ -186,11 +249,52 @@ func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.
 
 	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", command)
 	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", remoteDir, command)
-	if err := e.driver.Exec(ctx, tfCmd, remoteDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
-		return nil, fmt.Errorf("terraform %s failed: %w", command, err)
+	tfErr := e.driver.Exec(ctx, tfCmd, remoteDir, env, execCtx.Stdout, execCtx.Stderr)
+
+	if kv != nil {
+		if data, err := downloadRemoteFile(ctx, e.driver, remoteStatePath); err == nil {
+			persistState(ctx, kv, data, execCtx.Stdout, execCtx.Stderr)
+		} else {
+			fmt.Fprintf(execCtx.Stderr, "warning: could not retrieve remote state file: %v\n", err)
+		}
 	}
 
+	if tfErr != nil {
+		return nil, fmt.Errorf("terraform %s failed: %w", command, tfErr)
+	}
 	return map[string]string{"status": "success"}, nil
+}
+
+func writeTempFile(pattern string, data []byte) (string, error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("failed to write temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("failed to close temp file: %w", err)
+	}
+	return f.Name(), nil
+}
+
+func downloadRemoteFile(ctx context.Context, driver executor.NodeDriver, remotePath string) ([]byte, error) {
+	f, err := os.CreateTemp("", "remote-dl-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp file: %w", err)
+	}
+	localPath := f.Name()
+	f.Close()
+	defer os.Remove(localPath)
+
+	if err := driver.Download(ctx, remotePath, localPath); err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+	return os.ReadFile(localPath)
 }
 
 func isSSHURL(url string) bool {
