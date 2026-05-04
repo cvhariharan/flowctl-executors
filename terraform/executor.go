@@ -1,20 +1,14 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 
+	"github.com/cvhariharan/flowctl-executors/pkg/executorutil"
 	"github.com/cvhariharan/flowctl/sdk/executor"
-	"github.com/go-git/go-git/v5"
-	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
-	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/invopop/jsonschema"
 	"gopkg.in/yaml.v3"
 )
@@ -60,18 +54,6 @@ func (e *TerraformExecutor) Close() error {
 	return e.driver.Close()
 }
 
-var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
-
-func substituteEnvVars(s string, inputs map[string]any) string {
-	return envVarRe.ReplaceAllStringFunc(s, func(m string) string {
-		key := strings.TrimSpace(envVarRe.FindStringSubmatch(m)[1])
-		if v, ok := inputs[key]; ok {
-			return fmt.Sprintf("%v", v)
-		}
-		return m
-	})
-}
-
 func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.ExecutionContext) (map[string]string, error) {
 	var config TerraformWithConfig
 	if err := yaml.Unmarshal(execCtx.WithConfig, &config); err != nil {
@@ -85,50 +67,11 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 		config.Command = "apply -auto-approve"
 	}
 
-	token := substituteEnvVars(config.Token, execCtx.Inputs)
-
-	// Clone the repo locally
-	cloneDir, err := os.MkdirTemp("", "terraform-clone-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp dir for git clone: %w", err)
-	}
-	defer os.RemoveAll(cloneDir)
-
-	cloneOpts := &git.CloneOptions{
-		URL:   config.Repo,
-		Depth: 1,
-	}
-
-	if token != "" {
-		if isSSHURL(config.Repo) {
-			auth, err := gitssh.NewPublicKeys("git", []byte(token), "")
-			if err != nil {
-				return nil, fmt.Errorf("failed to create SSH auth: %w", err)
-			}
-			cloneOpts.Auth = auth
-		} else {
-			username := substituteEnvVars(config.Username, execCtx.Inputs)
-			if username == "" {
-				return nil, fmt.Errorf("username is required for HTTPS auth (e.g. 'x-access-token' for GitHub, 'oauth2' for GitLab)")
-			}
-			cloneOpts.Auth = &githttp.BasicAuth{
-				Username: username,
-				Password: token,
-			}
-		}
-	}
-
-	fmt.Fprintf(execCtx.Stdout, "Cloning repository %s...\n", config.Repo)
-	if _, err := git.PlainClone(cloneDir, false, cloneOpts); err != nil {
-		return nil, fmt.Errorf("failed to clone repository: %w", err)
-	}
-
-	moduleDir := cloneDir
-	if config.Path != "" {
-		moduleDir = filepath.Join(cloneDir, config.Path)
-		if _, err := os.Stat(moduleDir); err != nil {
-			return nil, fmt.Errorf("path %q not found in repository: %w", config.Path, err)
-		}
+	cloneOpts := executorutil.CloneOptions{
+		URL:      config.Repo,
+		Username: executorutil.SubstituteEnvVars(config.Username, execCtx.Inputs),
+		Token:    executorutil.SubstituteEnvVars(config.Token, execCtx.Inputs),
+		Stdout:   execCtx.Stdout,
 	}
 
 	env := os.Environ()
@@ -137,9 +80,9 @@ func (e *TerraformExecutor) Execute(ctx context.Context, execCtx executor.Execut
 	}
 
 	if e.driver.IsRemote() {
-		return e.executeRemote(ctx, execCtx, moduleDir, config.Command, env)
+		return e.executeRemote(ctx, execCtx, cloneOpts, config, env)
 	}
-	return e.executeLocal(ctx, execCtx, moduleDir, config.Command, env)
+	return e.executeLocal(ctx, execCtx, cloneOpts, config, env)
 }
 
 const stateFileName = "terraform.tfstate"
@@ -161,7 +104,25 @@ func (e *TerraformExecutor) stateKV(execCtx executor.ExecutionContext) *stateKV 
 	}
 }
 
-func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.ExecutionContext, moduleDir, command string, env []string) (map[string]string, error) {
+func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.ExecutionContext, cloneOpts executorutil.CloneOptions, config TerraformWithConfig, env []string) (map[string]string, error) {
+	cloneDir, err := os.MkdirTemp("", "terraform-clone-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir for git clone: %w", err)
+	}
+	defer os.RemoveAll(cloneDir)
+
+	if err := executorutil.Clone(ctx, nil, cloneDir, cloneOpts); err != nil {
+		return nil, err
+	}
+
+	moduleDir := cloneDir
+	if config.Path != "" {
+		moduleDir = filepath.Join(cloneDir, config.Path)
+		if _, err := os.Stat(moduleDir); err != nil {
+			return nil, fmt.Errorf("path %q not found in repository: %w", config.Path, err)
+		}
+	}
+
 	statePath := filepath.Join(moduleDir, stateFileName)
 	kv := e.stateKV(execCtx)
 	if kv != nil {
@@ -181,8 +142,8 @@ func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.E
 		return nil, fmt.Errorf("terraform init failed: %w", err)
 	}
 
-	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", command)
-	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", moduleDir, command)
+	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", config.Command)
+	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", moduleDir, config.Command)
 	tfErr := e.driver.Exec(ctx, tfCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr)
 
 	if kv != nil {
@@ -194,7 +155,7 @@ func (e *TerraformExecutor) executeLocal(ctx context.Context, execCtx executor.E
 	}
 
 	if tfErr != nil {
-		return nil, fmt.Errorf("terraform %s failed: %w", command, tfErr)
+		return nil, fmt.Errorf("terraform %s failed: %w", config.Command, tfErr)
 	}
 	return map[string]string{"status": "success"}, nil
 }
@@ -206,24 +167,22 @@ func persistState(ctx context.Context, kv *stateKV, data []byte, stdout, stderr 
 	}
 }
 
-func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.ExecutionContext, moduleDir, command string, env []string) (map[string]string, error) {
-	remoteDir := e.driver.Join(e.driver.TempDir(), "terraform-module")
-	if err := e.driver.CreateDir(ctx, remoteDir); err != nil {
-		return nil, fmt.Errorf("failed to create remote directory: %w", err)
-	}
-	defer e.driver.Remove(ctx, remoteDir)
+func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.ExecutionContext, cloneOpts executorutil.CloneOptions, config TerraformWithConfig, env []string) (map[string]string, error) {
+	cloneDir := e.driver.Join(e.driver.TempDir(), fmt.Sprintf("terraform-clone-%s", execCtx.ExecID))
+	// `git clone` requires the destination not to exist; clean up any prior leftover.
+	_ = e.driver.Remove(ctx, cloneDir)
+	defer e.driver.Remove(ctx, cloneDir)
 
-	tarballPath := filepath.Join(os.TempDir(), "terraform-module.tar.gz")
-	if err := compressDirectory(moduleDir, tarballPath); err != nil {
-		return nil, fmt.Errorf("failed to compress module directory: %w", err)
-	}
-	defer os.Remove(tarballPath)
-
-	if err := uploadAndExtract(ctx, e.driver, tarballPath, remoteDir, execCtx.Stdout); err != nil {
+	if err := executorutil.Clone(ctx, e.driver, cloneDir, cloneOpts); err != nil {
 		return nil, err
 	}
 
-	remoteStatePath := e.driver.Join(remoteDir, stateFileName)
+	moduleDir := cloneDir
+	if config.Path != "" {
+		moduleDir = e.driver.Join(cloneDir, config.Path)
+	}
+
+	remoteStatePath := e.driver.Join(moduleDir, stateFileName)
 	kv := e.stateKV(execCtx)
 	if kv != nil {
 		if state, err := kv.client.KVGet(ctx, kv.bucket, kv.key); err == nil && state != "" {
@@ -242,14 +201,14 @@ func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.
 	}
 
 	fmt.Fprintf(execCtx.Stdout, "Running terraform init...\n")
-	initCmd := fmt.Sprintf("terraform -chdir=%s init -no-color", remoteDir)
-	if err := e.driver.Exec(ctx, initCmd, remoteDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
+	initCmd := fmt.Sprintf("terraform -chdir=%s init -no-color", moduleDir)
+	if err := e.driver.Exec(ctx, initCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr); err != nil {
 		return nil, fmt.Errorf("terraform init failed: %w", err)
 	}
 
-	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", command)
-	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", remoteDir, command)
-	tfErr := e.driver.Exec(ctx, tfCmd, remoteDir, env, execCtx.Stdout, execCtx.Stderr)
+	fmt.Fprintf(execCtx.Stdout, "Running terraform %s...\n", config.Command)
+	tfCmd := fmt.Sprintf("terraform -chdir=%s %s -no-color", moduleDir, config.Command)
+	tfErr := e.driver.Exec(ctx, tfCmd, moduleDir, env, execCtx.Stdout, execCtx.Stderr)
 
 	if kv != nil {
 		if data, err := downloadRemoteFile(ctx, e.driver, remoteStatePath); err == nil {
@@ -260,7 +219,7 @@ func (e *TerraformExecutor) executeRemote(ctx context.Context, execCtx executor.
 	}
 
 	if tfErr != nil {
-		return nil, fmt.Errorf("terraform %s failed: %w", command, tfErr)
+		return nil, fmt.Errorf("terraform %s failed: %w", config.Command, tfErr)
 	}
 	return map[string]string{"status": "success"}, nil
 }
@@ -295,86 +254,6 @@ func downloadRemoteFile(ctx context.Context, driver executor.NodeDriver, remoteP
 		return nil, fmt.Errorf("download: %w", err)
 	}
 	return os.ReadFile(localPath)
-}
-
-func isSSHURL(url string) bool {
-	return strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://")
-}
-
-func compressDirectory(srcDir, tarballPath string) error {
-	outFile, err := os.Create(tarballPath)
-	if err != nil {
-		return fmt.Errorf("failed to create tarball file: %w", err)
-	}
-	defer outFile.Close()
-
-	gzWriter := gzip.NewWriter(outFile)
-	defer gzWriter.Close()
-
-	tarWriter := tar.NewWriter(gzWriter)
-	defer tarWriter.Close()
-
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir() && info.Name() == ".git" {
-			return filepath.SkipDir
-		}
-
-		header, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return fmt.Errorf("failed to create tar header for %s: %w", path, err)
-		}
-
-		// Use relative path
-		relPath, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return fmt.Errorf("failed to get relative path: %w", err)
-		}
-		header.Name = relPath
-
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return fmt.Errorf("failed to write tar header: %w", err)
-		}
-
-		if info.IsDir() {
-			return nil
-		}
-
-		file, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("failed to open file %s: %w", path, err)
-		}
-		defer file.Close()
-
-		if _, err := io.Copy(tarWriter, file); err != nil {
-			return fmt.Errorf("failed to write file to tar: %w", err)
-		}
-
-		return nil
-	})
-}
-
-func uploadAndExtract(ctx context.Context, driver executor.NodeDriver, tarballPath, remoteDir string, stdout io.Writer) error {
-	remoteTarball := driver.Join(driver.TempDir(), "terraform-module.tar.gz")
-
-	fmt.Fprintf(stdout, "Uploading module to remote node...\n")
-	if err := driver.Upload(ctx, tarballPath, remoteTarball); err != nil {
-		return fmt.Errorf("failed to upload tarball: %w", err)
-	}
-
-	extractCmd := fmt.Sprintf("tar -xzf %s -C %s", remoteTarball, remoteDir)
-	if err := driver.Exec(ctx, extractCmd, remoteDir, nil, stdout, stdout); err != nil {
-		return fmt.Errorf("failed to extract tarball on remote: %w", err)
-	}
-
-	if err := driver.Remove(ctx, remoteTarball); err != nil {
-		return fmt.Errorf("failed to remove remote tarball: %w", err)
-	}
-
-	return nil
 }
 
 // TerraformExecutorPlugin implements executor.ExecutorPlugin for the Terraform executor.
