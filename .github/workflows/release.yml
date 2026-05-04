@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'http/v*'
+      - 'terraform/v*'
+      - 'ansible/v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: parse
+        run: |
+          plugin="${GITHUB_REF_NAME%%/*}"
+          version="${GITHUB_REF_NAME#*/}"
+          echo "plugin=$plugin" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: ${{ steps.parse.outputs.plugin }}/go.sum
+
+      - name: build binaries
+        working-directory: ${{ steps.parse.outputs.plugin }}
+        env:
+          PLUGIN: ${{ steps.parse.outputs.plugin }}
+          VERSION: ${{ steps.parse.outputs.version }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p ../dist
+          for arch in amd64 arm64; do
+            out="../dist/${PLUGIN}-${VERSION}-linux-${arch}"
+            GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "$out" .
+            (cd ../dist && sha256sum "$(basename "$out")" >> "${PLUGIN}-${VERSION}-checksums.txt")
+          done
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ steps.parse.outputs.plugin }} ${{ steps.parse.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/${{ steps.parse.outputs.plugin }}-${{ steps.parse.outputs.version }}-linux-amd64
+            dist/${{ steps.parse.outputs.plugin }}-${{ steps.parse.outputs.version }}-linux-arm64
+            dist/${{ steps.parse.outputs.plugin }}-${{ steps.parse.outputs.version }}-checksums.txt

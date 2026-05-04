@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [http, terraform, ansible]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: ${{ matrix.plugin }}/go.sum
+
+      - name: go vet
+        working-directory: ${{ matrix.plugin }}
+        run: go vet ./...
+
+      - name: build
+        working-directory: ${{ matrix.plugin }}
+        run: go build -o ../plugins/${{ matrix.plugin }} .
